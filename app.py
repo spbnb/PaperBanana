@@ -491,7 +491,10 @@ def build_app():
         with gr.Accordion("API Keys", open=False):
             gr.Markdown(
                 "**You do not need both keys.** Fill **at least one**: **OpenRouter** *or* **Google (Gemini)**. "
-                "If both are set, OpenRouter is preferred for automatic routing when available."
+                "If both are set, OpenRouter is preferred for automatic routing when available. "
+                "Advanced settings such as custom `base_url` and text API mode are configurable via "
+                "`configs/model_config.yaml` or environment variables; text calls default to `chat.completions`. "
+                "Default OpenAI-compatible base URL is `https://api-slb.packyapi.com/v1/chat/completions`."
             )
             with gr.Row():
                 openrouter_key_input = gr.Textbox(
@@ -515,7 +518,7 @@ def build_app():
                     return f"Clients initialized: {', '.join(initialized)}."
                 return (
                     "Warning: no API clients could be initialized. "
-                    "Enter at least one key—OpenRouter or Google (Gemini)."
+                    "Enter at least one key: OpenRouter or Google (Gemini)."
                 )
 
             apply_keys_btn = gr.Button("Apply Keys", size="sm")

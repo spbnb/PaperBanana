@@ -19,6 +19,7 @@ Utility functions for interacting with Gemini and Claude APIs, image processing,
 import json
 import asyncio
 import base64
+import re
 from io import BytesIO
 from functools import partial
 from ast import literal_eval
@@ -50,12 +51,49 @@ def get_config_val(section, key, env_var, default=""):
         val = model_config[section].get(key)
     return val or default
 
+def _normalize_text_api_mode(mode: str) -> str:
+    """Normalize configured text endpoint mode to: responses | chat."""
+    mode_norm = (mode or "").strip().lower()
+    if mode_norm == "":
+        return "chat"
+    if mode_norm in ("chat", "chat.completions", "chat_completions"):
+        return "chat"
+    if mode_norm in ("responses", "response"):
+        return "responses"
+    print(f"[Warning] Unknown text API mode '{mode}', defaulting to 'chat'.")
+    return "chat"
+
+
+DEFAULT_OPENAI_COMPAT_BASE_URL = "https://api-slb.packyapi.com/v1/chat/completions"
+
+
+def _normalize_openai_compat_base_url(base_url: str, default_base_url: str) -> str:
+    """Normalize OpenAI-compatible base URL to a root path (typically .../v1)."""
+    raw = (base_url or default_base_url or "").strip()
+    if not raw:
+        return ""
+
+    normalized = raw.rstrip("/")
+    lower = normalized.lower()
+    if lower.endswith("/responses"):
+        normalized = normalized[: -len("/responses")]
+    elif lower.endswith("/chat/completions"):
+        normalized = normalized[: -len("/chat/completions")]
+
+    return normalized.rstrip("/")
+
 # Initialize clients lazily or with robust defaults
 gemini_client = None
 anthropic_client = None
 openai_client = None
 openrouter_client = None
 openrouter_api_key = ""
+openrouter_base_url = _normalize_openai_compat_base_url(
+    DEFAULT_OPENAI_COMPAT_BASE_URL,
+    DEFAULT_OPENAI_COMPAT_BASE_URL,
+)
+openai_text_api_mode = "chat"
+openrouter_text_api_mode = "chat"
 
 
 def reinitialize_clients():
@@ -67,9 +105,16 @@ def reinitialize_clients():
     Returns a list of client names that were successfully initialized.
     """
     global gemini_client, anthropic_client, openai_client
-    global openrouter_client, openrouter_api_key
+    global openrouter_client, openrouter_api_key, openrouter_base_url
+    global openai_text_api_mode, openrouter_text_api_mode
 
     initialized = []
+    openai_text_api_mode = _normalize_text_api_mode(
+        get_config_val("api_modes", "openai_text_api", "OPENAI_TEXT_API", "chat")
+    )
+    openrouter_text_api_mode = _normalize_text_api_mode(
+        get_config_val("api_modes", "openrouter_text_api", "OPENROUTER_TEXT_API", "chat")
+    )
 
     api_key = get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "")
     if api_key:
@@ -89,22 +134,42 @@ def reinitialize_clients():
 
     key = get_config_val("api_keys", "openai_api_key", "OPENAI_API_KEY", "")
     if key:
-        openai_client = AsyncOpenAI(api_key=key)
-        print("Initialized OpenAI Client with API Key")
+        openai_base_url = _normalize_openai_compat_base_url(
+            get_config_val("endpoints", "openai_base_url", "OPENAI_BASE_URL", DEFAULT_OPENAI_COMPAT_BASE_URL),
+            DEFAULT_OPENAI_COMPAT_BASE_URL,
+        )
+        openai_kwargs = {"api_key": key}
+        if openai_base_url:
+            openai_kwargs["base_url"] = openai_base_url
+        openai_client = AsyncOpenAI(**openai_kwargs)
+        print(f"Initialized OpenAI Client with API Key (text mode: {openai_text_api_mode})")
         initialized.append("OpenAI")
     else:
         openai_client = None
 
     openrouter_api_key = get_config_val("api_keys", "openrouter_api_key", "OPENROUTER_API_KEY", "")
     if openrouter_api_key:
+        openrouter_base_url = _normalize_openai_compat_base_url(
+            get_config_val(
+                "endpoints", "openrouter_base_url", "OPENROUTER_BASE_URL", DEFAULT_OPENAI_COMPAT_BASE_URL
+            ),
+            DEFAULT_OPENAI_COMPAT_BASE_URL,
+        )
         openrouter_client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
+            base_url=openrouter_base_url,
             api_key=openrouter_api_key,
         )
-        print("Initialized OpenRouter Client with API Key")
+        print(
+            f"Initialized OpenRouter Client with API Key "
+            f"(base_url: {openrouter_base_url}, text mode: {openrouter_text_api_mode})"
+        )
         initialized.append("OpenRouter")
     else:
         openrouter_client = None
+        openrouter_base_url = _normalize_openai_compat_base_url(
+            DEFAULT_OPENAI_COMPAT_BASE_URL,
+            DEFAULT_OPENAI_COMPAT_BASE_URL,
+        )
 
     return initialized
 
@@ -285,6 +350,95 @@ def _convert_to_openai_format(contents: List[Dict[str, Any]]) -> List[Dict[str, 
     return openai_contents
 
 
+def _convert_to_responses_user_content(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert generic content list to Responses API user content blocks."""
+    responses_content = []
+    for item in contents:
+        if item.get("type") == "text":
+            text = item.get("text", "")
+            if text:
+                responses_content.append({"type": "input_text", "text": text})
+        elif item.get("type") == "image":
+            source = item.get("source", {})
+            if source.get("type") == "base64":
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                if data:
+                    responses_content.append(
+                        {"type": "input_image", "image_url": f"data:{media_type};base64,{data}"}
+                    )
+            elif "image_base64" in item:
+                data = item.get("image_base64", "")
+                if data:
+                    responses_content.append(
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{data}"}
+                    )
+    return responses_content
+
+
+def _build_responses_input(system_prompt: str, contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build OpenAI Responses API input payload."""
+    payload = []
+    if system_prompt:
+        payload.append(
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            }
+        )
+
+    user_content = _convert_to_responses_user_content(contents)
+    if not user_content:
+        user_content = [{"type": "input_text", "text": ""}]
+
+    payload.append({"role": "user", "content": user_content})
+    return payload
+
+
+def _extract_text_from_responses(response: Any) -> str:
+    """Extract text output from an OpenAI Responses API object."""
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+    if isinstance(output_text, list):
+        merged = "".join(x for x in output_text if isinstance(x, str))
+        if merged.strip():
+            return merged
+
+    output = getattr(response, "output", None)
+    if output is None and isinstance(response, dict):
+        output = response.get("output")
+
+    texts = []
+    for out_item in output or []:
+        content = out_item.get("content") if isinstance(out_item, dict) else getattr(out_item, "content", None)
+        for part in content or []:
+            part_type = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if part_type not in ("output_text", "text"):
+                continue
+            text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            if text:
+                texts.append(text)
+
+    return "".join(texts)
+
+
+def _responses_unsupported_error(exc: Exception) -> bool:
+    """Heuristic to detect endpoints that do not support /responses."""
+    msg = str(exc).lower()
+    tokens = [
+        "/responses",
+        "responses",
+        "unsupported",
+        "not found",
+        "unknown url",
+        "unrecognized request",
+        "no such endpoint",
+        "method not allowed",
+    ]
+    return any(t in msg for t in tokens)
+
+
 async def call_claude_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
 ):
@@ -381,6 +535,7 @@ async def call_openai_with_retry_async(
     candidate_num = config["candidate_num"]
     max_completion_tokens = config["max_completion_tokens"]
     response_text_list = []
+    use_responses = openai_text_api_mode != "chat"
 
     # --- Preparation Phase ---
     # Convert to the OpenAI-specific format
@@ -391,19 +546,28 @@ async def call_openai_with_retry_async(
     is_input_valid = False
     for attempt in range(max_attempts):
         try:
-            openai_contents = _convert_to_openai_format(current_contents)
-            # Attempt to generate the very first candidate.
-            first_response = await openai_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": openai_contents}
-                ],
-                temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
-            )
-            # If we reach here, the input is valid.
-            content = first_response.choices[0].message.content or ""
+            if use_responses:
+                responses_input = _build_responses_input(system_prompt, current_contents)
+                first_response = await openai_client.responses.create(
+                    model=model_name,
+                    input=responses_input,
+                    temperature=temperature,
+                    max_output_tokens=max_completion_tokens,
+                )
+                content = _extract_text_from_responses(first_response)
+            else:
+                openai_contents = _convert_to_openai_format(current_contents)
+                first_response = await openai_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": openai_contents}
+                    ],
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                )
+                content = first_response.choices[0].message.content or ""
+
             if not content.strip():
                 print(f"OpenAI returned empty content, retrying...")
                 if attempt < max_attempts - 1:
@@ -414,6 +578,10 @@ async def call_openai_with_retry_async(
             break  # Exit the validation loop
 
         except Exception as e:
+            if use_responses and _responses_unsupported_error(e):
+                print("OpenAI /responses endpoint unavailable; falling back to chat.completions.")
+                use_responses = False
+                continue
             error_str = str(e).lower()
             context_msg = f" for {error_context}" if error_context else ""
             print(
@@ -435,19 +603,31 @@ async def call_openai_with_retry_async(
         print(
             f"Input validated. Now generating remaining {remaining_candidates} candidates..."
         )
-        valid_openai_contents = _convert_to_openai_format(current_contents)
-        tasks = [
-            openai_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": valid_openai_contents}
-                ],
-                temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
-            )
-            for _ in range(remaining_candidates)
-        ]
+        if use_responses:
+            valid_input = _build_responses_input(system_prompt, current_contents)
+            tasks = [
+                openai_client.responses.create(
+                    model=model_name,
+                    input=valid_input,
+                    temperature=temperature,
+                    max_output_tokens=max_completion_tokens,
+                )
+                for _ in range(remaining_candidates)
+            ]
+        else:
+            valid_openai_contents = _convert_to_openai_format(current_contents)
+            tasks = [
+                openai_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": valid_openai_contents}
+                    ],
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                )
+                for _ in range(remaining_candidates)
+            ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
@@ -455,7 +635,11 @@ async def call_openai_with_retry_async(
                 print(f"Error generating a subsequent candidate: {res}")
                 response_text_list.append("Error")
             else:
-                response_text_list.append(res.choices[0].message.content or "Error")
+                if use_responses:
+                    text = _extract_text_from_responses(res)
+                    response_text_list.append(text or "Error")
+                else:
+                    response_text_list.append(res.choices[0].message.content or "Error")
 
     return response_text_list
 
@@ -533,23 +717,35 @@ async def call_openrouter_with_retry_async(
     candidate_num = config["candidate_num"]
     max_completion_tokens = config["max_completion_tokens"]
     response_text_list = []
+    use_responses = openrouter_text_api_mode != "chat"
 
     current_contents = contents
 
     is_input_valid = False
     for attempt in range(max_attempts):
         try:
-            openai_contents = _convert_to_openai_format(current_contents)
-            first_response = await openrouter_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": openai_contents},
-                ],
-                temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
-            )
-            content = first_response.choices[0].message.content or ""
+            if use_responses:
+                responses_input = _build_responses_input(system_prompt, current_contents)
+                first_response = await openrouter_client.responses.create(
+                    model=model_name,
+                    input=responses_input,
+                    temperature=temperature,
+                    max_output_tokens=max_completion_tokens,
+                )
+                content = _extract_text_from_responses(first_response)
+            else:
+                openai_contents = _convert_to_openai_format(current_contents)
+                first_response = await openrouter_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": openai_contents},
+                    ],
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                )
+                content = first_response.choices[0].message.content or ""
+
             if not content.strip():
                 print(f"OpenRouter returned empty content, retrying...")
                 if attempt < max_attempts - 1:
@@ -560,6 +756,10 @@ async def call_openrouter_with_retry_async(
             break
 
         except Exception as e:
+            if use_responses and _responses_unsupported_error(e):
+                print("OpenRouter /responses endpoint unavailable; falling back to chat.completions.")
+                use_responses = False
+                continue
             error_str = str(e).lower()
             context_msg = f" for {error_context}" if error_context else ""
             current_delay = min(retry_delay * (2 ** attempt), 60)
@@ -577,38 +777,211 @@ async def call_openrouter_with_retry_async(
 
     remaining_candidates = candidate_num - 1
     if remaining_candidates > 0:
-        valid_openai_contents = _convert_to_openai_format(current_contents)
-        tasks = [
-            openrouter_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": valid_openai_contents},
-                ],
-                temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
-            )
-            for _ in range(remaining_candidates)
-        ]
+        if use_responses:
+            valid_input = _build_responses_input(system_prompt, current_contents)
+            tasks = [
+                openrouter_client.responses.create(
+                    model=model_name,
+                    input=valid_input,
+                    temperature=temperature,
+                    max_output_tokens=max_completion_tokens,
+                )
+                for _ in range(remaining_candidates)
+            ]
+        else:
+            valid_openai_contents = _convert_to_openai_format(current_contents)
+            tasks = [
+                openrouter_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": valid_openai_contents},
+                    ],
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                )
+                for _ in range(remaining_candidates)
+            ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
             if isinstance(res, Exception):
                 print(f"Error generating a subsequent OpenRouter candidate: {res}")
                 response_text_list.append("Error")
             else:
-                response_text_list.append(res.choices[0].message.content or "Error")
+                if use_responses:
+                    text = _extract_text_from_responses(res)
+                    response_text_list.append(text or "Error")
+                else:
+                    response_text_list.append(res.choices[0].message.content or "Error")
 
     return response_text_list
+
+
+def _extract_b64_from_data_url(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    # Direct data URL
+    if text.startswith("data:image") and "," in text:
+        return text.split(",", 1)[1].strip()
+
+    # Markdown-wrapped image, e.g. ![image](data:image/png;base64,...)
+    m = re.search(r"data:image/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=\r\n]+)", text)
+    if m:
+        return m.group(1).replace("\n", "").replace("\r", "").strip()
+    return ""
+
+
+def _extract_image_ref_from_obj(obj: Any) -> tuple[str, str]:
+    """Return first image ref found in obj: ("b64", data) | ("url", http_url) | ("", "")."""
+    if obj is None:
+        return "", ""
+
+    if isinstance(obj, str):
+        b64 = _extract_b64_from_data_url(obj)
+        if b64:
+            return "b64", b64
+        if obj.startswith("http://") or obj.startswith("https://"):
+            return "url", obj
+        return "", ""
+
+    if isinstance(obj, list):
+        for item in obj:
+            t, v = _extract_image_ref_from_obj(item)
+            if t:
+                return t, v
+        return "", ""
+
+    if not isinstance(obj, dict):
+        return "", ""
+
+    for key in ("b64_json", "image_base64", "base64", "b64"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return "b64", val.strip()
+
+    inline_data = obj.get("inline_data")
+    if isinstance(inline_data, dict):
+        data = inline_data.get("data")
+        if isinstance(data, str) and data.strip():
+            return "b64", data.strip()
+
+    image_url = obj.get("image_url")
+    if isinstance(image_url, dict):
+        url = image_url.get("url")
+        if isinstance(url, str) and url.strip():
+            b64 = _extract_b64_from_data_url(url)
+            if b64:
+                return "b64", b64
+            if url.startswith("http://") or url.startswith("https://"):
+                return "url", url
+    elif isinstance(image_url, str) and image_url.strip():
+        b64 = _extract_b64_from_data_url(image_url)
+        if b64:
+            return "b64", b64
+        if image_url.startswith("http://") or image_url.startswith("https://"):
+            return "url", image_url
+
+    for key in ("url", "data"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            b64 = _extract_b64_from_data_url(val)
+            if b64:
+                return "b64", b64
+            if key == "url" and (val.startswith("http://") or val.startswith("https://")):
+                return "url", val
+
+    for key in ("images", "content", "message", "delta", "output", "parts"):
+        if key in obj:
+            t, v = _extract_image_ref_from_obj(obj.get(key))
+            if t:
+                return t, v
+
+    for val in obj.values():
+        t, v = _extract_image_ref_from_obj(val)
+        if t:
+            return t, v
+
+    return "", ""
+
+
+def _extract_image_ref_from_chat_response(data: Dict[str, Any]) -> tuple[str, str]:
+    """Extract image from chat/non-chat response payload."""
+    if not isinstance(data, dict):
+        return "", ""
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for ch in choices:
+            t, v = _extract_image_ref_from_obj(ch)
+            if t:
+                return t, v
+
+    if "output" in data:
+        t, v = _extract_image_ref_from_obj(data.get("output"))
+        if t:
+            return t, v
+
+    return "", ""
+
+
+async def _download_image_url_as_b64(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(url)
+        resp.raise_for_status()
+        if not resp.content:
+            return ""
+        return base64.b64encode(resp.content).decode("utf-8")
+    except Exception as e:
+        print(f"[Warning]: Failed to download image URL returned by gateway: {e}")
+        return ""
+
+
+async def _stream_openrouter_image_b64(
+    url: str, headers: Dict[str, str], payload: Dict[str, Any]
+) -> str:
+    """Try streaming chat completion and return first image base64 found."""
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        async with client.stream("POST", url, headers=headers, json=stream_payload) as resp:
+            resp.raise_for_status()
+            async for raw_line in resp.aiter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str:
+                    continue
+                if data_str == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                ref_type, ref_val = _extract_image_ref_from_chat_response(evt)
+                if ref_type == "b64" and ref_val:
+                    return ref_val
+                if ref_type == "url" and ref_val:
+                    b64 = await _download_image_url_as_b64(ref_val)
+                    if b64:
+                        return b64
+    return ""
 
 
 async def call_openrouter_image_generation_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
 ):
     """
-    ASYNC: Call OpenRouter image generation via direct httpx POST to avoid
-    openai SDK issues with extra_body dropping the model field.
-    Images are returned in choices[0].message.content as inline_data or
-    in choices[0].message.images as data URLs.
+    ASYNC: Call OpenRouter image generation via chat completions.
+    Supports streaming-first parsing (when available) and non-stream fallback.
     """
     if not openrouter_api_key:
         raise RuntimeError(
@@ -619,6 +992,7 @@ async def call_openrouter_image_generation_with_retry_async(
     temperature = config.get("temperature", 1.0)
     aspect_ratio = config.get("aspect_ratio", "1:1")
     image_size = config.get("image_size", "1k")
+    use_stream = bool(config.get("stream", True))
 
     model_name = _to_openrouter_model_id(model_name)
     openai_contents = _convert_to_openai_format(contents)
@@ -645,12 +1019,27 @@ async def call_openrouter_image_generation_with_retry_async(
         "Authorization": f"Bearer {openrouter_api_key}",
         "Content-Type": "application/json",
     }
+    post_url = f"{openrouter_base_url}/chat/completions"
 
     for attempt in range(max_attempts):
         try:
+            if use_stream:
+                try:
+                    b64_stream = await _stream_openrouter_image_b64(post_url, headers, payload)
+                    if b64_stream:
+                        return [b64_stream]
+                except httpx.HTTPStatusError as e:
+                    if e.response is not None and e.response.status_code in (400, 404, 405, 422):
+                        print("[Info]: Streaming image endpoint unsupported; falling back to non-stream response.")
+                        use_stream = False
+                    else:
+                        raise
+                except Exception as e:
+                    print(f"[Warning]: Streaming parse failed, falling back to non-stream: {e}")
+
             async with httpx.AsyncClient(timeout=300) as client:
                 resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
+                    post_url,
                     headers=headers,
                     json=payload,
                 )
@@ -664,38 +1053,27 @@ async def call_openrouter_image_generation_with_retry_async(
                     await asyncio.sleep(retry_delay)
                 continue
 
-            message = choices[0].get("message", {})
-
-            # Try extracting from inline_data in content (Gemini-style)
-            content = message.get("content")
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and "inline_data" in part:
-                        b64_data = part["inline_data"].get("data", "")
-                        if b64_data:
-                            return [b64_data]
-
-            # Try extracting from images field (OpenRouter standard)
-            images = message.get("images")
-            if images and len(images) > 0:
-                img_item = images[0]
-                if isinstance(img_item, dict):
-                    data_url = img_item.get("image_url", {}).get("url", "")
-                else:
-                    data_url = str(img_item)
-                if "," in data_url:
-                    b64_data = data_url.split(",", 1)[1]
-                else:
-                    b64_data = data_url
+            ref_type, ref_val = _extract_image_ref_from_chat_response(data)
+            if ref_type == "b64" and ref_val:
+                return [ref_val]
+            if ref_type == "url" and ref_val:
+                b64_data = await _download_image_url_as_b64(ref_val)
                 if b64_data:
                     return [b64_data]
 
-            # Try extracting base64 from text content
-            if isinstance(content, str) and content.startswith("data:image"):
-                if "," in content:
-                    b64_data = content.split(",", 1)[1]
-                    if b64_data:
-                        return [b64_data]
+            if attempt == 0:
+                top_keys = list(data.keys()) if isinstance(data, dict) else []
+                msg_keys = []
+                try:
+                    msg_obj = data.get("choices", [{}])[0].get("message", {})
+                    if isinstance(msg_obj, dict):
+                        msg_keys = list(msg_obj.keys())
+                except Exception:
+                    pass
+                print(
+                    f"[Debug]: No image parsed from gateway response. "
+                    f"top_keys={top_keys}, message_keys={msg_keys}"
+                )
 
             print(f"[Warning]: OpenRouter image generation returned no images, retrying...")
             if attempt < max_attempts - 1:
@@ -730,17 +1108,20 @@ async def call_openrouter_image_generation_with_retry_async(
 
     return ["Error"]
 
-
 def _to_openrouter_model_id(model_name: str) -> str:
-    """Convert a bare model name to OpenRouter format (provider/model).
+    """Normalize model IDs for OpenAI-compatible routers.
 
-    OpenRouter requires model IDs like 'google/gemini-3-pro-preview'.
-    If the name already contains '/', assume it's already qualified.
-    Otherwise, prefix with 'google/' for Gemini models.
+    Behaviour:
+    - If model already contains "/", keep it unchanged.
+    - If using the official openrouter.ai endpoint and model starts with "gemini",
+      auto-prefix to "google/<model>" for compatibility.
+    - For custom gateways (e.g. Packy), keep bare model names unchanged.
     """
     if "/" in model_name:
         return model_name
-    if model_name.startswith("gemini"):
+
+    base = (openrouter_base_url or "").lower()
+    if "openrouter.ai" in base and model_name.startswith("gemini"):
         return f"google/{model_name}"
     return model_name
 
