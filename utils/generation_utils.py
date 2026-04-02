@@ -817,6 +817,16 @@ async def call_openrouter_with_retry_async(
     return response_text_list
 
 
+def _normalize_image_size_for_openrouter(image_size: Any) -> str:
+    """Normalize image_size for OpenAI-compatible gateways (usually expects lowercase)."""
+    s = str(image_size or "").strip().lower()
+    if s in ("1k", "2k", "4k"):
+        return s
+    if s in ("1024", "1024x1024"):
+        return "1k"
+    return "1k"
+
+
 def _extract_b64_from_data_url(value: str) -> str:
     if not isinstance(value, str):
         return ""
@@ -1015,7 +1025,7 @@ async def call_openrouter_image_generation_with_retry_async(
     system_prompt = config.get("system_prompt", "")
     temperature = config.get("temperature", 1.0)
     aspect_ratio = config.get("aspect_ratio", "1:1")
-    image_size = config.get("image_size", "1K")
+    image_size = _normalize_image_size_for_openrouter(config.get("image_size", "1K"))
     use_stream = bool(config.get("stream", True))
 
     model_name = _to_openrouter_model_id(model_name)
@@ -1026,6 +1036,9 @@ async def call_openrouter_image_generation_with_retry_async(
         image_config["aspect_ratio"] = aspect_ratio
     if image_size:
         image_config["image_size"] = image_size
+
+    # Debug: helps verify requested resolution reaches gateway
+    print(f"[ImageGen] Request image_size={image_size}, aspect_ratio={aspect_ratio}, model={model_name}")
 
     payload = {
         "model": model_name,

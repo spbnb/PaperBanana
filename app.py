@@ -224,29 +224,48 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
         return None, f"{via} error: {str(e)}"
 
 
+def get_available_critic_rounds(result, task_name="diagram"):
+    """Return sorted critic round ids that have valid base64 images."""
+    rounds = []
+    prefix = f"target_{task_name}_critic_desc"
+    suffix = "_base64_jpg"
+
+    for key, value in (result or {}).items():
+        if not value:
+            continue
+        if key.startswith(prefix) and key.endswith(suffix):
+            round_str = key[len(prefix):-len(suffix)]
+            if round_str.isdigit():
+                rounds.append(int(round_str))
+
+    return sorted(set(rounds))
+
+
 def get_evolution_stages(result, exp_mode):
     task_name = "diagram"
     stages = []
+
     # Planner
     k = f"target_{task_name}_desc0_base64_jpg"
     if k in result and result[k]:
         stages.append({"name": "Planner", "image_key": k, "desc_key": f"target_{task_name}_desc0", "description": "Initial diagram plan"})
+
     # Stylist (demo_full only)
     if exp_mode == "demo_full":
         k = f"target_{task_name}_stylist_desc0_base64_jpg"
         if k in result and result[k]:
             stages.append({"name": "Stylist", "image_key": k, "desc_key": f"target_{task_name}_stylist_desc0", "description": "Stylistically refined"})
-    # Critic rounds
-    for r in range(4):
-        k = f"target_{task_name}_critic_desc{r}_base64_jpg"
-        if k in result and result[k]:
-            stages.append({
-                "name": f"Critic Round {r}",
-                "image_key": k,
-                "desc_key": f"target_{task_name}_critic_desc{r}",
-                "suggestions_key": f"target_{task_name}_critic_suggestions{r}",
-                "description": f"Refined after critic iteration {r}",
-            })
+
+    # Critic rounds (dynamic)
+    for r in get_available_critic_rounds(result, task_name=task_name):
+        stages.append({
+            "name": f"Critic Round {r}",
+            "image_key": f"target_{task_name}_critic_desc{r}_base64_jpg",
+            "desc_key": f"target_{task_name}_critic_desc{r}",
+            "suggestions_key": f"target_{task_name}_critic_suggestions{r}",
+            "description": f"Refined after critic iteration {r}",
+        })
+
     return stages
 
 
@@ -255,12 +274,13 @@ def get_final_image(result, exp_mode):
     task_name = "diagram"
     final_key = None
     final_desc_key = None
-    for r in range(3, -1, -1):
-        k = f"target_{task_name}_critic_desc{r}_base64_jpg"
-        if k in result and result[k]:
-            final_key = k
-            final_desc_key = f"target_{task_name}_critic_desc{r}"
-            break
+
+    critic_rounds = get_available_critic_rounds(result, task_name=task_name)
+    if critic_rounds:
+        best_round = critic_rounds[-1]
+        final_key = f"target_{task_name}_critic_desc{best_round}_base64_jpg"
+        final_desc_key = f"target_{task_name}_critic_desc{best_round}"
+
     if not final_key:
         if exp_mode == "demo_full":
             final_key = f"target_{task_name}_stylist_desc0_base64_jpg"
@@ -268,6 +288,7 @@ def get_final_image(result, exp_mode):
         else:
             final_key = f"target_{task_name}_desc0_base64_jpg"
             final_desc_key = f"target_{task_name}_desc0"
+
     img = base64_to_image(result.get(final_key)) if final_key else None
     desc = clean_text(result.get(final_desc_key, "")) if final_desc_key else ""
     return img, desc
@@ -733,17 +754,31 @@ def build_app():
 
                     # Build ZIP
                     zip_path = None
+                    critic_images_saved = 0
                     if save_results != "No":
                         try:
                             zip_filename = results_dir / f"papervizagent_candidates_{timestamp_str}.zip"
                             buf = BytesIO()
                             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                                 for idx, res in enumerate(results):
+                                    # Keep original final image naming for compatibility
                                     img, _ = get_final_image(res, pipe_mode)
                                     if img:
                                         ib = BytesIO()
                                         img.save(ib, format="PNG")
                                         zf.writestr(f"candidate_{idx}.png", ib.getvalue())
+
+                                    # Save each Critic Round image per candidate
+                                    for r in get_available_critic_rounds(res, task_name="diagram"):
+                                        critic_key = f"target_diagram_critic_desc{r}_base64_jpg"
+                                        critic_img = base64_to_image(res.get(critic_key))
+                                        if not critic_img:
+                                            continue
+                                        cb = BytesIO()
+                                        critic_img.save(cb, format="PNG")
+                                        zf.writestr(f"candidate_{idx}/critic_round_{r}.png", cb.getvalue())
+                                        critic_images_saved += 1
+
                             buf.seek(0)
                             with open(zip_filename, "wb") as wf:
                                 wf.write(buf.getvalue())
@@ -754,6 +789,8 @@ def build_app():
                     status = f"Generated {len(results)} candidates at {datetime.now().strftime('%H:%M:%S')}."
                     if json_filename and Path(str(json_filename)).exists():
                         status += f" JSON saved to {Path(str(json_filename)).name}."
+                    if zip_path:
+                        status += f" ZIP saved with {critic_images_saved} critic-round images."
 
                     progress(1.0, desc="Done!")
                     return (
