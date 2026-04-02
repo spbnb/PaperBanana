@@ -99,13 +99,20 @@ def base64_to_image(b64_str):
         return None
 
 
-def create_sample_inputs(method_content, caption, aspect_ratio="16:9", num_copies=10, max_critic_rounds=3):
+def create_sample_inputs(
+    method_content,
+    caption,
+    aspect_ratio="16:9",
+    image_size="1K",
+    num_copies=10,
+    max_critic_rounds=3,
+):
     base_input = {
         "filename": "demo_input",
         "caption": caption,
         "content": method_content,
         "visual_intent": caption,
-        "additional_info": {"rounded_ratio": aspect_ratio},
+        "additional_info": {"rounded_ratio": aspect_ratio, "image_size": image_size},
         "max_critic_rounds": max_critic_rounds,
     }
     inputs = []
@@ -446,6 +453,7 @@ def build_app():
 
     default_main_model = get_config_val("defaults", "main_model_name", "MAIN_MODEL_NAME", "gemini-3.1-pro-preview")
     default_image_model = get_config_val("defaults", "image_gen_model_name", "IMAGE_GEN_MODEL_NAME", "gemini-3.1-flash-image-preview")
+    default_image_size = get_config_val("defaults", "image_size", "IMAGE_SIZE", "1K")
 
     with gr.Blocks(title="PaperBanana") as app:
         # ---- State to hold results across interactions ----
@@ -571,6 +579,11 @@ def build_app():
                             value="21:9",
                             label="Aspect Ratio",
                         )
+                        image_resolution = gr.Dropdown(
+                            choices=["1K", "2K", "4K"],
+                            value=default_image_size if default_image_size in ["1K", "2K", "4K"] else "1K",
+                            label="Image Resolution",
+                        )
                         figure_size = gr.Dropdown(
                             choices=["1-3cm", "4-6cm", "7-9cm", "10-13cm", "14-17cm"],
                             value="7-9cm",
@@ -655,7 +668,7 @@ def build_app():
                 # ---- Generate handler ----
                 def run_generate(
                     method_text, caption_text, pipe_mode, ret_setting,
-                    n_cands, ar, max_rounds, m_model, img_model,
+                    n_cands, ar, img_size, max_rounds, m_model, img_model,
                     figure_size, save_results,
                     progress=gr.Progress(track_tqdm=True),
                 ):
@@ -669,7 +682,8 @@ def build_app():
                     progress(0, desc="Preparing inputs...")
                     input_data = create_sample_inputs(
                         method_content=method_text, caption=caption_text,
-                        aspect_ratio=ar, num_copies=n_cands, max_critic_rounds=max_rounds,
+                        aspect_ratio=ar, image_size=img_size,
+                        num_copies=n_cands, max_critic_rounds=max_rounds,
                     )
                     params = {"figure_size": figure_size}
 
@@ -756,7 +770,7 @@ def build_app():
                     fn=run_generate,
                     inputs=[
                         method_content, caption_input, pipeline_mode, retrieval_setting,
-                        num_candidates, aspect_ratio, max_critic_rounds,
+                        num_candidates, aspect_ratio, image_resolution, max_critic_rounds,
                         main_model_name, image_model_name,
                         figure_size, save_results,
                     ],

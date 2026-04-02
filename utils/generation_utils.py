@@ -976,6 +976,30 @@ async def _stream_openrouter_image_b64(
     return ""
 
 
+async def _safe_http_error_detail(e: httpx.HTTPStatusError, max_chars: int = 1200) -> str:
+    """Safely read HTTP error body without triggering ResponseNotRead."""
+    resp = e.response
+    if resp is None:
+        return "<no response body>"
+
+    try:
+        raw = await resp.aread()
+        if not raw:
+            return "<empty response body>"
+        text = raw.decode("utf-8", errors="replace")
+    except Exception as read_err:
+        # Fallback for already-buffered non-stream responses.
+        try:
+            text = resp.text
+        except Exception:
+            return f"<response body unavailable: {read_err}>"
+
+    text = (text or "").strip()
+    if len(text) > max_chars:
+        return text[:max_chars] + "...(truncated)"
+    return text or "<empty response body>"
+
+
 async def call_openrouter_image_generation_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
 ):
@@ -991,7 +1015,7 @@ async def call_openrouter_image_generation_with_retry_async(
     system_prompt = config.get("system_prompt", "")
     temperature = config.get("temperature", 1.0)
     aspect_ratio = config.get("aspect_ratio", "1:1")
-    image_size = config.get("image_size", "1k")
+    image_size = config.get("image_size", "1K")
     use_stream = bool(config.get("stream", True))
 
     model_name = _to_openrouter_model_id(model_name)
@@ -1029,8 +1053,15 @@ async def call_openrouter_image_generation_with_retry_async(
                     if b64_stream:
                         return [b64_stream]
                 except httpx.HTTPStatusError as e:
-                    if e.response is not None and e.response.status_code in (400, 404, 405, 422):
+                    status_code = e.response.status_code if e.response is not None else None
+                    if status_code in (400, 404, 405, 422):
                         print("[Info]: Streaming image endpoint unsupported; falling back to non-stream response.")
+                        use_stream = False
+                    elif status_code is not None and status_code >= 500:
+                        print(
+                            f"[Warning]: Streaming image endpoint returned HTTP {status_code}; "
+                            "falling back to non-stream response."
+                        )
                         use_stream = False
                     else:
                         raise
@@ -1083,9 +1114,11 @@ async def call_openrouter_image_generation_with_retry_async(
         except httpx.HTTPStatusError as e:
             context_msg = f" for {error_context}" if error_context else ""
             current_delay = min(retry_delay * (2 ** attempt), 60)
+            status_code = e.response.status_code if e.response is not None else "unknown"
+            error_detail = await _safe_http_error_detail(e)
             print(
                 f"OpenRouter image gen attempt {attempt + 1} failed{context_msg}: "
-                f"HTTP {e.response.status_code} - {e.response.text}. "
+                f"HTTP {status_code} - {error_detail}. "
                 f"Retrying in {current_delay}s..."
             )
             if attempt < max_attempts - 1:

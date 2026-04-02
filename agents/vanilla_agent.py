@@ -127,7 +127,10 @@ class VanillaAgent(BaseAgent):
             "max_output_tokens": 50000,
         }
         
-        aspect_ratio = data["additional_info"]["rounded_ratio"]
+        aspect_ratio = data["additional_info"].get("rounded_ratio", "16:9")
+        image_size = data.get("additional_info", {}).get(
+            "image_size", generation_utils.get_config_val("defaults", "image_size", "IMAGE_SIZE", "1K")
+        )
 
         if cfg["use_image_generation"]:
             if "gpt-image" in self.model_name:
@@ -149,7 +152,7 @@ class VanillaAgent(BaseAgent):
                     "system_prompt": self.system_prompt,
                     "temperature": self.exp_config.temperature,
                     "aspect_ratio": aspect_ratio,
-                    "image_size": "1k",
+                    "image_size": image_size,
                 }
                 response_list = await generation_utils.call_openrouter_image_generation_with_retry_async(
                     model_name=self.model_name,
@@ -162,7 +165,7 @@ class VanillaAgent(BaseAgent):
                 gen_config_args["response_modalities"] = ["IMAGE"]
                 gen_config_args["image_config"] = types.ImageConfig(
                     aspect_ratio=aspect_ratio,
-                    image_size="1k",
+                    image_size=image_size,
                 )
                 response_list = await generation_utils.call_gemini_with_retry_async(
                     model_name=self.model_name,
